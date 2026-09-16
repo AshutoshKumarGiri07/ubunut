@@ -1,3 +1,7 @@
+#!/bin/bash
+
+set -x
+
 systemctl stop snapd.service snapd.socket
 
 snap list
@@ -12,8 +16,10 @@ rm -rf /snap
 rm -rf /var/snap
 rm -rf /var/lib/snapd
 rm -rf /var/cache/snapd
-rm -rf ~/snap
+rm -rf /home/*/snap
 rm -rf /root/snap
 
 apt autoremove -y --purge
 apt autoclean
+
+dpkg -l | grep -i snap
