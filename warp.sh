@@ -3,7 +3,7 @@ set -e
 
 # Ensure the script is run as root
 if [ "$EUID" -ne 0 ]; then
-    echo "Please run as root (use: curl -sL <URL> | sudo bash)"
+    echo "Please run as root (use: sudo bash install-warp.sh)"
     exit 1
 fi
 
@@ -11,15 +11,14 @@ fi
 BASE_PORTS=(22 3389)
 ALL_PORTS=("${BASE_PORTS[@]}" "$@")
 
-# Deduplicate ports and format for nftables and bash arrays
+# Deduplicate ports and format for iptables (comma-separated)
 UNIQUE_PORTS=($(printf "%s\n" "${ALL_PORTS[@]}" | awk '/^[0-9]+$/' | sort -nu))
-NFT_PORTS=$(IFS=,; echo "${UNIQUE_PORTS[*]}" | sed 's/,/, /g')
-ARRAY_PORTS="${UNIQUE_PORTS[*]}"
+COMMA_PORTS=$(IFS=,; echo "${UNIQUE_PORTS[*]}")
 
 echo "==> [1/5] Installing prerequisites and official Cloudflare WARP repository..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y curl gpg nftables iproute2 lsb-release ca-certificates
+apt-get install -y curl gpg iptables iproute2 lsb-release ca-certificates
 
 if ! command -v warp-cli >/dev/null 2>&1; then
     curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
@@ -31,53 +30,47 @@ else
     echo "    cloudflare-warp is already installed."
 fi
 
-echo "==> [2/5] Creating /usr/local/bin/warp-port-guard.sh for ports: ${NFT_PORTS}..."
+echo "==> [2/5] Creating /usr/local/bin/warp-port-guard.sh for ports: ${COMMA_PORTS}..."
 cat << EOF > /usr/local/bin/warp-port-guard.sh
 #!/usr/bin/env bash
-# Ports kept on the Oracle Public IP (bypassing WARP)
-TCP_PORTS="${NFT_PORTS}"
-UDP_PORTS="${NFT_PORTS}"
-RULE_PORTS=(${ARRAY_PORTS})
+# Connection Marking Script: Bypasses WARP for incoming public traffic
+PORTS="${COMMA_PORTS}"
 
 IFACE=\$(ip -4 route show table main default | awk '{for(i=1;i<=NF;i++) if(\$i=="dev") print \$(i+1); exit}')
 GW=\$(ip -4 route show table main default | awk '{for(i=1;i<=NF;i++) if(\$i=="via") print \$(i+1); exit}')
 
-if [ -n "\$IFACE" ] && [ -n "\$GW" ]; then
-    sysctl -qw net.ipv4.conf.all.rp_filter=2
-    sysctl -qw "net.ipv4.conf.\${IFACE}.rp_filter=2"
-    ip route replace default via "\$GW" dev "\$IFACE" onlink table 200
+if [ -z "\$IFACE" ] || [ -z "\$GW" ]; then
+    echo "Waiting for network..."
+    sleep 5
+    exit 0
+fi
+
+# 1. Ensure table 200 routes back out the physical gateway
+ip route replace default via "\$GW" dev "\$IFACE" onlink table 200
+
+# 2. Add an IP rule to look up table 200 for marked packets
+if ! ip rule show | grep -q "fwmark 0x200 lookup 200"; then
+    ip rule add fwmark 0x200 pref 99 table 200
 fi
 
 while true; do
-    WARP_PREF=\$(ip -4 rule show | awk -F: '/0x100cf|65743/ {gsub(/ /,"",\$1); print \$1; exit}')
-    OUR_PREF=\$(ip -4 rule show | awk -F: '/lookup 200/ {gsub(/ /,"",\$1); print \$1; exit}')
-
-    if [ -n "\$WARP_PREF" ]; then
-        if [ -z "\$OUR_PREF" ] || [ "\$OUR_PREF" -ge "\$WARP_PREF" ]; then
-            TARGET_PREF=\$(( WARP_PREF > 100 ? 100 : WARP_PREF - 1 ))
-            while ip rule del table 200 2>/dev/null; do :; done
-            for PORT in "\${RULE_PORTS[@]}"; do
-                ip rule add sport "\$PORT" table 200 pref "\$TARGET_PREF"
-                ip rule add dport "\$PORT" table 200 pref "\$TARGET_PREF"
-            done
-        fi
-
-        if nft list table inet cloudflare-warp >/dev/null 2>&1; then
-            if ! nft list chain inet cloudflare-warp input 2>/dev/null | grep -q "warp-keep-ports"; then
-                nft insert rule inet cloudflare-warp input iifname "\$IFACE" tcp dport "{ \$TCP_PORTS }" accept comment \"warp-keep-ports\"
-                nft insert rule inet cloudflare-warp input iifname "\$IFACE" udp dport "{ \$UDP_PORTS }" accept comment \"warp-keep-ports\"
-            fi
-            if ! nft list chain inet cloudflare-warp output 2>/dev/null | grep -q "warp-keep-ports"; then
-                nft insert rule inet cloudflare-warp output oifname "\$IFACE" tcp sport "{ \$TCP_PORTS }" accept comment \"warp-keep-ports\"
-                nft insert rule inet cloudflare-warp output oifname "\$IFACE" udp sport "{ \$UDP_PORTS }" accept comment \"warp-keep-ports\"
-            fi
-        fi
-    else
-        if [ -n "\$OUR_PREF" ]; then
-            while ip rule del table 200 2>/dev/null; do :; done
-        fi
+    # 3. TCP: Mark incoming connections and restore mark on outgoing replies
+    if ! iptables -t mangle -C PREROUTING -i "\$IFACE" -p tcp -m multiport --dports "\$PORTS" -j CONNMARK --set-mark 0x200 2>/dev/null; then
+        iptables -t mangle -A PREROUTING -i "\$IFACE" -p tcp -m multiport --dports "\$PORTS" -j CONNMARK --set-mark 0x200
     fi
-    sleep 1
+    if ! iptables -t mangle -C OUTPUT -p tcp -m multiport --sports "\$PORTS" -j CONNMARK --restore-mark 2>/dev/null; then
+        iptables -t mangle -A OUTPUT -p tcp -m multiport --sports "\$PORTS" -j CONNMARK --restore-mark
+    fi
+
+    # 4. UDP: Mark incoming connections and restore mark on outgoing replies
+    if ! iptables -t mangle -C PREROUTING -i "\$IFACE" -p udp -m multiport --dports "\$PORTS" -j CONNMARK --set-mark 0x200 2>/dev/null; then
+        iptables -t mangle -A PREROUTING -i "\$IFACE" -p udp -m multiport --dports "\$PORTS" -j CONNMARK --set-mark 0x200
+    fi
+    if ! iptables -t mangle -C OUTPUT -p udp -m multiport --sports "\$PORTS" -j CONNMARK --restore-mark 2>/dev/null; then
+        iptables -t mangle -A OUTPUT -p udp -m multiport --sports "\$PORTS" -j CONNMARK --restore-mark
+    fi
+
+    sleep 5
 done
 EOF
 chmod +x /usr/local/bin/warp-port-guard.sh
@@ -85,15 +78,15 @@ chmod +x /usr/local/bin/warp-port-guard.sh
 echo "==> [3/5] Enabling and starting warp-port-guard systemd service..."
 cat << 'EOF' > /etc/systemd/system/warp-port-guard.service
 [Unit]
-Description=Keep Public Ports (SSH/RDP) Alive on Oracle Public IP with Cloudflare WARP
-After=network-online.target
+Description=Keep Public Ports (SSH/RDP) Alive via iptables CONNMARK
+After=network-online.target iptables.service
 Wants=network-online.target
 
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/warp-port-guard.sh
 Restart=always
-RestartSec=1
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
@@ -127,8 +120,8 @@ WARP_STATE=$(echo "$TRACE" | awk -F= '/^warp=/ {print $2}')
 WARP_IP=$(echo "$TRACE" | awk -F= '/^ip=/ {print $2}')
 
 echo "======================================================"
-echo " Cloudflare WARP Setup Complete!"
-echo " Protected Public Ports : ${NFT_PORTS}"
+echo " Cloudflare WARP Setup Complete (Robust IPTables Mode)!"
+echo " Protected Public Ports : ${COMMA_PORTS}"
 echo " Guard Service Status   : $(systemctl is-active warp-port-guard.service)"
 echo " WARP Tunnel Status     : ${WARP_STATE:-unknown}"
 echo " Outbound WARP IP       : ${WARP_IP:-unknown}"
